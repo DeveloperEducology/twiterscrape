@@ -27,7 +27,11 @@ if (!MONGO_URI) {
 }
 mongoose.connect(MONGO_URI)
   .then(() => console.log("✅ MongoDB connected successfully."))
-  .catch((err) => console.error("❌ MongoDB connection error:", err));
+  .catch((err) => {
+    console.error("❌ MongoDB connection error:", err);
+    // ✅ FIX: Exit the process if the database connection fails on startup.
+    process.exit(1);
+  });
 
 // --- Mongoose Schema ---
 const ArticleSchema = new mongoose.Schema({
@@ -50,7 +54,7 @@ const ArticleSchema = new mongoose.Schema({
 
 const Article = mongoose.model('Article', ArticleSchema);
 
-// --- 🆕 Main Scraper Function with Retries and Longer Timeout ---
+// --- Main Scraper Function with Retries and Longer Timeout ---
 async function scrapeTweets(username, requiredTweetCount = 25) {
   if (!fs.existsSync(COOKIES_FILE_PATH)) {
     throw new Error("Cookies file not found. On Render, ensure TWITTER_COOKIES environment variable is set.");
@@ -69,7 +73,7 @@ async function scrapeTweets(username, requiredTweetCount = 25) {
     const page = await context.newPage();
     const targetUrl = `https://x.com/${username}`;
 
-    // ✅ Retry Logic
+    // Retry Logic
     let timelineLoaded = false;
     for (let attempt = 1; attempt <= 2; attempt++) {
         try {
@@ -96,7 +100,7 @@ async function scrapeTweets(username, requiredTweetCount = 25) {
 
     if (!timelineLoaded) throw new Error("Could not load the timeline.");
 
-    // Aggressive scrolling logic... (no changes here)
+    // Aggressive scrolling logic
     let tweetCount = 0;
     const maxScrolls = 10;
     for (let i = 0; i < maxScrolls; i++) {
