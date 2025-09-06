@@ -50,16 +50,15 @@ const ArticleSchema = new mongoose.Schema({
 
 const Article = mongoose.model('Article', ArticleSchema);
 
-// --- Main Scraper Function ---
+// --- 🆕 Main Scraper Function with Retries and Longer Timeout ---
 async function scrapeTweets(username, requiredTweetCount = 25) {
   if (!fs.existsSync(COOKIES_FILE_PATH)) {
     throw new Error("Cookies file not found. On Render, ensure TWITTER_COOKIES environment variable is set.");
   }
   
-  // ✅ FIX: Explicitly tell Playwright where to find the browser on Render
   const browser = await chromium.launch({ 
     headless: true,
-    args: ["--no-sandbox"] // Recommended for Linux environments like Render
+    args: ["--no-sandbox"]
   });
   
   let context;
@@ -69,9 +68,35 @@ async function scrapeTweets(username, requiredTweetCount = 25) {
     await context.addCookies(cookies);
     const page = await context.newPage();
     const targetUrl = `https://x.com/${username}`;
-    await page.goto(targetUrl, { waitUntil: "domcontentloaded" });
-    await page.waitForSelector("div[data-testid='cellInnerDiv']", { timeout: 25000 });
 
+    // ✅ Retry Logic
+    let timelineLoaded = false;
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+            console.log(`[Attempt ${attempt}] Navigating to ${targetUrl}...`);
+            await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 }); // 60s timeout
+            await page.waitForSelector("div[data-testid='cellInnerDiv']", { timeout: 60000 }); // 60s timeout
+            timelineLoaded = true;
+            console.log(`[Attempt ${attempt}] Timeline loaded successfully.`);
+            break; // Exit loop on success
+        } catch (error) {
+            console.warn(`[Attempt ${attempt}] Failed to load timeline: ${error.message}`);
+            if (attempt === 2) {
+                console.error("❌ All attempts failed. Capturing page content for debugging...");
+                const pageContent = await page.content();
+                console.error("--- PAGE CONTENT ON FAILURE ---");
+                console.error(pageContent);
+                console.error("-----------------------------");
+                throw new Error("Failed to load the tweet timeline after multiple attempts.");
+            }
+            console.log("Reloading page and retrying...");
+            await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
+        }
+    }
+
+    if (!timelineLoaded) throw new Error("Could not load the timeline.");
+
+    // Aggressive scrolling logic... (no changes here)
     let tweetCount = 0;
     const maxScrolls = 10;
     for (let i = 0; i < maxScrolls; i++) {
@@ -79,9 +104,7 @@ async function scrapeTweets(username, requiredTweetCount = 25) {
         await page.evaluate(() => window.scrollBy(0, 2500));
         await page.waitForTimeout(2000);
         tweetCount = await page.locator("article[data-testid='tweet']").count();
-        if (tweetCount >= requiredTweetCount || tweetCount === previousTweetCount) {
-            break;
-        }
+        if (tweetCount >= requiredTweetCount || tweetCount === previousTweetCount) break;
     }
 
     const scrapedTweets = await page.$$eval(
@@ -167,7 +190,7 @@ app.get("/scrape/:username", async (req, res) => {
         source: `Twitter @${username}`,
         isCreatedBy: "twitter",
         publishedAt: new Date(tweet.date),
-        media: media,
+        media: tweet.media,
       };
       return Article.updateOne({ url: articleData.url }, { $setOnInsert: articleData }, { upsert: true });
     });
