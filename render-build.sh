@@ -3,4 +3,6 @@
 set -o errexit
 
 npm install
-npx playwright install --with-deps chromium
+# FIX: Install Chromium without the --with-deps flag to avoid the password prompt error.
+npx playwright install chromium
+
