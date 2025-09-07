@@ -6,7 +6,8 @@
   "scripts": {
     "start": "nodemon server.js",
     "login": "node login.js",
-    "postinstall": "npx playwright install --without-browsers"
+    "postinstall": "npx playwright install chromium"
+
   },
   "keywords": [],
   "author": "",
