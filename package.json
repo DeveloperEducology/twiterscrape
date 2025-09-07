@@ -5,7 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "nodemon server.js",
-    "login": "node login.js",
+    "login": "node login.js"
   },
   "keywords": [],
   "author": "",
