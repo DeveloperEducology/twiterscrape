@@ -1,219 +1,260 @@
-import express from "express";
-import cors from "cors";
-import fs from "fs";
 import { chromium } from "playwright";
 import mongoose from "mongoose";
 import dotenv from "dotenv";
+import cron from "node-cron";
+import fetch from "node-fetch";
+import fs from "fs";
 
 // --- Configuration ---
 dotenv.config();
-const PORT = process.env.PORT || 8000;
-const COOKIES_FILE_PATH = "./cookies.json";
 const MONGO_URI = process.env.MONGO_URI;
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const COOKIES_FILE_PATH = "./cookies.json";
 
-// --- Logic to Create cookies.json on Render ---
-if (process.env.TWITTER_COOKIES) {
-  if (!fs.existsSync(COOKIES_FILE_PATH)) {
-    console.log("[DEBUG] cookies.json not found. Creating from environment variable...");
+// --- ⬇️ ADD THE TWITTER USERNAMES YOU WANT TO SCRAPE HERE ---
+const TARGET_USERNAMES = ["BCCI","CricCrazyJohns","IndianTechGuide", "mufaddal_vohra", "bigtvtelugu","balaji25_t","GulteOfficial", "narendramodi", "AshwiniVaishnaw", "vamsikaka"];
+
+// ✅ FIX: Add a lock flag to prevent concurrent job execution
+let isJobRunning = false;
+
+// --- Server Initialization Checks ---
+if (!MONGO_URI || !GEMINI_API_KEY) {
+  console.error(
+    "❌ ERROR: MONGO_URI and GEMINI_API_KEY must be defined in your .env file."
+  );
+  process.exit(1);
+}
+
+if (process.env.TWITTER_COOKIES && !fs.existsSync(COOKIES_FILE_PATH)) {
+    console.log("[SETUP] Creating cookies.json from TWITTER_COOKIES environment variable...");
     fs.writeFileSync(COOKIES_FILE_PATH, process.env.TWITTER_COOKIES);
-    console.log("[DEBUG] cookies.json created successfully for the server session.");
-  }
 }
 
 // --- MongoDB Connection ---
-if (!MONGO_URI) {
-  console.error("❌ ERROR: MONGO_URI is not defined in your .env file.");
-  process.exit(1);
-}
-mongoose.connect(MONGO_URI)
+mongoose
+  .connect(MONGO_URI)
   .then(() => console.log("✅ MongoDB connected successfully."))
-  .catch((err) => {
-    console.error("❌ MongoDB connection error:", err);
-    // ✅ FIX: Exit the process if the database connection fails on startup.
-    process.exit(1);
-  });
+  .catch((err) => console.error("❌ MongoDB connection error:", err));
 
 // --- Mongoose Schema ---
 const ArticleSchema = new mongoose.Schema({
-  title: { type: String, required: true },
-  summary: { type: String },
-  body: { type: String },
-  url: { type: String, required: true, unique: true },
-  source: { type: String, required: true, index: true },
-  isCreatedBy: {
-    type: String,
-    required: true,
-    enum: ['twitter', 'rss', 'manual']
-  },
-  publishedAt: { type: Date, required: true },
-  media: [{
-    mediaType: { type: String, enum: ['image', 'video_post'], required: true },
-    url: { type: String, required: true }
-  }]
+    title: { type: String, required: true },
+    summary: { type: String, required: true },
+    body: { type: String },
+    url: { type: String, required: true, unique: true },
+    source: { type: String, required: true, index: true },
+    isCreatedBy: { type: String, required: true, default: "twitter_gemini" },
+    publishedAt: { type: Date, required: true },
+    media: [{
+        mediaType: { type: String, enum: ["image", "video_post", "youtube_video"], required: true },
+        url: { type: String, required: true },
+    }],
 }, { timestamps: true });
 
-const Article = mongoose.model('Article', ArticleSchema);
+const Article = mongoose.model("Article", ArticleSchema);
 
-// --- Main Scraper Function with Retries and Longer Timeout ---
-async function scrapeTweets(username, requiredTweetCount = 25) {
-  if (!fs.existsSync(COOKIES_FILE_PATH)) {
-    throw new Error("Cookies file not found. On Render, ensure TWITTER_COOKIES environment variable is set.");
-  }
-  
-  const browser = await chromium.launch({ 
-    headless: true,
-    args: ["--no-sandbox"]
-  });
-  
-  let context;
-  try {
-    const cookies = JSON.parse(fs.readFileSync(COOKIES_FILE_PATH, 'utf8'));
-    context = await browser.newContext();
-    await context.addCookies(cookies);
-    const page = await context.newPage();
-    const targetUrl = `https://x.com/${username}`;
+const delay = (ms) => new Promise(resolve => setTimeout(resolve, ms));
 
-    // Retry Logic
-    let timelineLoaded = false;
-    for (let attempt = 1; attempt <= 2; attempt++) {
-        try {
-            console.log(`[Attempt ${attempt}] Navigating to ${targetUrl}...`);
-            await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: 60000 }); // 60s timeout
-            await page.waitForSelector("div[data-testid='cellInnerDiv']", { timeout: 60000 }); // 60s timeout
-            timelineLoaded = true;
-            console.log(`[Attempt ${attempt}] Timeline loaded successfully.`);
-            break; // Exit loop on success
-        } catch (error) {
-            console.warn(`[Attempt ${attempt}] Failed to load timeline: ${error.message}`);
-            if (attempt === 2) {
-                console.error("❌ All attempts failed. Capturing page content for debugging...");
-                const pageContent = await page.content();
-                console.error("--- PAGE CONTENT ON FAILURE ---");
-                console.error(pageContent);
-                console.error("-----------------------------");
-                throw new Error("Failed to load the tweet timeline after multiple attempts.");
-            }
-            console.log("Reloading page and retrying...");
-            await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
-        }
+async function scrapeUserProfile(username) {
+    if (!fs.existsSync(COOKIES_FILE_PATH)) {
+        console.error(`❌ Cookies file not found for @${username}. Cannot scrape profile.`);
+        return [];
     }
 
-    if (!timelineLoaded) throw new Error("Could not load the timeline.");
+    console.log(`[SCRAPE] Starting profile scrape for @${username}...`);
+    const browser = await chromium.launch({ headless: true });
+    const context = await browser.newContext();
 
-    // Aggressive scrolling logic
-    let tweetCount = 0;
-    const maxScrolls = 10;
-    for (let i = 0; i < maxScrolls; i++) {
-        const previousTweetCount = tweetCount;
-        await page.evaluate(() => window.scrollBy(0, 2500));
-        await page.waitForTimeout(2000);
-        tweetCount = await page.locator("article[data-testid='tweet']").count();
-        if (tweetCount >= requiredTweetCount || tweetCount === previousTweetCount) break;
+    try {
+        const cookies = JSON.parse(fs.readFileSync(COOKIES_FILE_PATH, 'utf8'));
+        await context.addCookies(cookies);
+        const page = await context.newPage();
+        await page.goto(`https://x.com/${username}`, { waitUntil: "domcontentloaded" });
+        await page.waitForSelector("article[data-testid='tweet']", { timeout: 20000 });
+
+        await page.evaluate(() => window.scrollBy(0, 1500));
+        await page.waitForTimeout(1500);
+
+        const scrapedTweets = await page.$$eval("article[data-testid='tweet']", (articles) =>
+            articles.slice(0, 10).map((article) => {
+                const timeEl = article.querySelector("a[href*='/status/'] time");
+                const linkEl = timeEl ? timeEl.closest("a") : null;
+                const textEl = article.querySelector("div[data-testid='tweetText']");
+
+                if (!linkEl || !textEl) return null;
+
+                const media = [];
+                if (article.querySelector("div[data-testid='videoPlayer']")) {
+                    media.push({ mediaType: "video_post", url: linkEl.href });
+                } else {
+                    article.querySelectorAll("div[data-testid='tweetPhoto'] img").forEach((img) => {
+                        if (img.src) {
+                            const highResUrl = new URL(img.src);
+                            highResUrl.searchParams.delete('name');
+                            highResUrl.searchParams.set('format', 'jpg');
+                            media.push({ mediaType: "image", url: highResUrl.href });
+                        }
+                    });
+                }
+                const youtubeRegex = /(?:https?:\/\/)?(?:www\.)?(?:youtube\.com\/(?:watch\?v=|embed\/)|youtu\.be\/)([a-zA-Z0-9_-]{11})/;
+                const youtubeMatch = (textEl.innerText || "").match(youtubeRegex);
+                if (youtubeMatch && youtubeMatch[1]) {
+                    media.unshift({ mediaType: "youtube_video", url: youtubeMatch[1] });
+                }
+
+                return {
+                    text: textEl.innerText,
+                    url: linkEl.href,
+                    date: timeEl.getAttribute("datetime"),
+                    media,
+                };
+            })
+        );
+
+        const validTweets = scrapedTweets.filter(Boolean);
+        console.log(`[SCRAPE] Found ${validTweets.length} recent tweets for @${username}.`);
+        return validTweets;
+
+    } catch (error) {
+        console.error(`❌ Failed to scrape profile @${username}:`, error.message);
+        return [];
+    } finally {
+        if (browser) await browser.close();
     }
-
-    const scrapedTweets = await page.$$eval(
-      "article[data-testid='tweet']",
-      (articles) =>
-        articles.map((article) => {
-          const mainTimeEl = article.querySelector("a[href*='/status/'] time");
-          if (!mainTimeEl) return null;
-          const mainLinkEl = mainTimeEl.closest("a");
-          const textEl = article.querySelector("div[data-testid='tweetText']");
-          if (!mainLinkEl || !textEl) return null;
-          const media = [];
-          const hasVideoPlayer = article.querySelector("div[data-testid='videoPlayer']");
-          if (hasVideoPlayer) {
-            let videoPostUrl = mainLinkEl.href;
-            const quotedTweetContainer = article.querySelector("div[role='link'][tabindex='0']");
-            if (quotedTweetContainer) {
-              const quotedTimeEl = quotedTweetContainer.querySelector("time");
-              const quotedLinkEl = quotedTimeEl ? quotedTimeEl.closest("a") : null;
-              if (quotedLinkEl && quotedLinkEl.href) videoPostUrl = quotedLinkEl.href;
-            }
-            media.push({ mediaType: 'video_post', url: videoPostUrl });
-          } else {
-            article.querySelectorAll("div[data-testid='tweetPhoto'] img").forEach(img => {
-              if (img.src) media.push({ mediaType: 'image', url: img.src });
-            });
-          }
-          return {
-            text: textEl.innerText,
-            url: mainLinkEl.href,
-            date: mainTimeEl.getAttribute("datetime"),
-            media: media,
-          };
-        })
-    );
-
-    const validTweets = scrapedTweets.filter(t => t !== null);
-    return validTweets.sort((a, b) => new Date(b.date) - new Date(a.date));
-
-  } finally {
-    if (browser) await browser.close();
-  }
 }
 
-// --- Express Server Setup ---
-const app = express();
-app.use(cors());
-app.use(express.json());
+async function summarizeWithGemini(text) {
+    if (!text) return null;
 
-// --- API Endpoints ---
-app.get("/", (req, res) => res.send("Stealth Media Scraper server is running."));
+    const API_URL = `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash-latest:generateContent?key=${GEMINI_API_KEY}`;
+    const prompt = `You are a professional Telugu news editor. Analyze the following text and generate a news report.
+    Provide your response ONLY in JSON format with two keys: "title" and "summary".
+    The "title" must be a short, engaging headline in Telugu.
+    The "summary" must be a single paragraph of about 85 words in Telugu.
+    Do not include any text or markdown formatting outside of the JSON object.
 
-app.get("/scrape/:username", async (req, res) => {
-  const { username } = req.params;
-  const count = parseInt(req.query.count, 10) || 5;
+    Text to analyze: "${text}"`;
 
-  try {
-    const TWEETS_TO_SCRAPE = 40; 
-    const recentTweetsFromPage = await scrapeTweets(username, TWEETS_TO_SCRAPE);
-    if (recentTweetsFromPage.length === 0) {
-      return res.status(404).json({ message: "No tweets found on the user's profile." });
+    let currentDelay = 1000;
+    const maxRetries = 3;
+
+    for (let i = 0; i < maxRetries; i++) {
+        try {
+            console.log("[GEMINI] Sending content to Gemini for summarization...");
+            const response = await fetch(API_URL, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+            });
+
+            if (response.status === 429) {
+                console.warn(`[GEMINI] Rate limit hit. Retrying in ${currentDelay / 1000}s... (Attempt ${i + 1}/${maxRetries})`);
+                await delay(currentDelay);
+                currentDelay *= 2;
+                continue;
+            }
+
+            if (!response.ok) {
+                throw new Error(`API call failed: ${response.status}`);
+            }
+
+            const data = await response.json();
+            const content = data?.candidates?.[0]?.content?.parts?.[0]?.text;
+
+            if (!content) {
+                throw new Error("Invalid response structure from Gemini API.");
+            }
+
+            const jsonString = content.replace(/```json|```/g, "").trim();
+            const parsedJson = JSON.parse(jsonString);
+            console.log("[GEMINI] Successfully received summary from Gemini.");
+            return parsedJson;
+
+        } catch (error) {
+            console.error(`❌ Error with Gemini API on attempt ${i + 1}:`, error.message);
+            if (i === maxRetries - 1) {
+                return null;
+            }
+            await delay(currentDelay);
+            currentDelay *= 2;
+        }
     }
-    const standardizedTweets = recentTweetsFromPage.map(tweet => ({
-        ...tweet,
-        url: tweet.url.replace('x.com', 'twitter.com'),
-        media: tweet.media.map(m => ({ ...m, url: m.url.replace('x.com', 'twitter.com') }))
-    }));
-    const scrapedUrls = standardizedTweets.map(t => t.url);
-    const existingArticles = await Article.find({ url: { $in: scrapedUrls } }).select('url -_id');
-    const existingUrls = new Set(existingArticles.map(a => a.url));
-    const newTweets = standardizedTweets.filter(tweet => !existingUrls.has(tweet.url));
-    if (newTweets.length === 0) {
-      return res.status(200).json({ message: "Scraping complete. No new tweets found.", username });
+    return null;
+}
+
+/**
+ * The main processing function that orchestrates scraping and saving.
+ */
+async function processTweets() {
+    // ✅ FIX: Check if the job is already running and exit if it is.
+    if (isJobRunning) {
+        console.log("[INFO] A previous job is still running. Skipping this scheduled run.");
+        return;
     }
-    const maxToSave = Math.min(count, 25);
-    const tweetsToSave = newTweets.slice(0, maxToSave);
-    const savePromises = tweetsToSave.map(tweet => {
-      const articleData = {
-        title: tweet.text.slice(0, 150) + (tweet.text.length > 150 ? '...' : ''),
-        summary: tweet.text,
-        body: tweet.text,
-        url: tweet.url,
-        source: `Twitter @${username}`,
-        isCreatedBy: "twitter",
-        publishedAt: new Date(tweet.date),
-        media: tweet.media,
-      };
-      return Article.updateOne({ url: articleData.url }, { $setOnInsert: articleData }, { upsert: true });
-    });
-    const results = await Promise.all(savePromises);
-    const newArticlesSavedCount = results.filter(r => r.upsertedCount > 0).length;
-    res.status(200).json({
-      message: "Scrape and save operation completed successfully.",
-      username,
-      newArticlesSaved: newArticlesSavedCount,
-      articles: tweetsToSave,
-    });
-  } catch (error) {
-    console.error(`❌ Top-level error for @${username}:`, error);
-    res.status(500).json({ error: "Failed to scrape or save tweets.", details: error.message });
-  }
-});
 
-// --- Start Server ---
-app.listen(PORT, () => {
-  console.log(`🚀 Server is live at http://localhost:${PORT}`);
-});
+    // ✅ FIX: Set the lock flag and wrap the entire process in a try...finally block.
+    isJobRunning = true;
+    try {
+        console.log("\n🚀 Starting scheduled job...");
 
+        for (const username of TARGET_USERNAMES) {
+            const recentTweets = await scrapeUserProfile(username);
+            if (recentTweets.length === 0) {
+                console.log(`[INFO] No new tweets found for @${username}. Skipping.`);
+                continue;
+            }
+
+            const scrapedUrls = recentTweets.map(t => t.url);
+            const existingArticles = await Article.find({ url: { $in: scrapedUrls } }).select('url -_id');
+            const existingUrls = new Set(existingArticles.map(a => a.url));
+            const newTweets = recentTweets.filter(tweet => !existingUrls.has(tweet.url));
+
+            if (newTweets.length === 0) {
+                console.log(`[INFO] All scraped tweets for @${username} are already in the database.`);
+                continue;
+            }
+
+            console.log(`[PROCESS] Found ${newTweets.length} new tweets for @${username} to process.`);
+
+            for (const tweet of newTweets) {
+                const summarizedArticle = await summarizeWithGemini(tweet.text);
+
+                if (summarizedArticle && summarizedArticle.title && summarizedArticle.summary) {
+                    const articleData = {
+                        title: summarizedArticle.title,
+                        summary: summarizedArticle.summary,
+                        body: tweet.text,
+                        url: tweet.url.replace("x.com", "twitter.com"),
+                        isCreatedBy: "twitter_gemini", 
+                        source: `Twitter @${username}`,
+                        publishedAt: new Date(tweet.date),
+                        media: tweet.media,
+                    };
+                    await Article.updateOne({ url: articleData.url }, { $setOnInsert: articleData }, { upsert: true });
+                    console.log(`✅ Successfully saved article: ${tweet.url}`);
+                } else {
+                    console.error(`Skipping save for ${tweet.url} due to failed summarization.`);
+                }
+                
+                await delay(1000);
+            }
+        }
+        console.log("✅ Scheduled job finished.");
+    } catch (error) {
+        console.error("❌ An unexpected error occurred during the job:", error);
+    } finally {
+        // ✅ FIX: Always release the lock, even if an error occurs.
+        isJobRunning = false;
+        console.log("[INFO] Job lock released.");
+    }
+}
+
+// Cron Job Scheduling: Runs every 10 minutes.
+// cron.schedule("*/10 * * * *", processTweets);
+
+console.log(
+  `🚀 News Scraper & Summarizer is running. Will process tweets from ${TARGET_USERNAMES.length} users every 10 minutes.`
+);
+
+// Run the job immediately on start for the first time
+// processTweets();
